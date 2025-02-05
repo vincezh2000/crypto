@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Crypto Visualization (Fixed Layout + Hide/Show Volume)</title>
+  <script src="https://cdn.socket.io/3.1.3/socket.io.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+
+  <style>
+    /* 全局样式 */
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: sans-serif;
+    }
+    #controls {
+      padding: 10px;
+      background: #f1f1f1;
+    }
+    /* charts-wrapper: 一个不自动伸展的容器，内部是两个固定高度的区域 */
+    #charts-wrapper {
+      margin: 20px;
+      width: calc(100% - 40px); /* 给一点左右边距 */
+      border: 1px solid #ddd;
+      /* 不指定固定总高度的话，会由子元素(两个图表)撑开 */
+    }
+    /* 价格图区域，固定高度 500px（可根据需求调整） */
+    #price-chart-container {
+      height: 500px;
+      position: relative;
+      background: #fff;
+      margin-bottom: 4px; /* 两块区域之间稍微留点间距 */
+    }
+    /* 成交量图区域，固定高度 200px（可根据需求调整） */
+    #volume-chart-container {
+      height: 200px;
+      position: relative;
+      background: #fff;
+    }
+    /* 隐藏时 (display: none)，不会影响价格图的高度 */
+    .hidden {
+      display: none !important;
+    }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <!-- 切换Symbol/Interval -->
+  <label>Symbol:</label>
+  <input type="text" id="symbol-input" value="BTCUSDT" style="width:80px" />
+
+  <label>Interval:</label>
+  <select id="interval-select">
+    <option value="1m" selected>1m</option>
+    <option value="5m">5m</option>
+    <option value="15m">15m</option>
+    <option value="1h">1h</option>
+    <option value="4h">4h</option>
+    <option value="1d">1d</option>
+  </select>
+  <button id="load-btn">切换并加载</button>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- Boll 参数 -->
+  <label>Boll Period:</label>
+  <input type="number" id="boll-period" value="20" style="width:50px"/>
+  <label>K:</label>
+  <input type="number" step="0.1" id="boll-k" value="2.0" style="width:50px"/>
+  <button id="save-boll-btn">保存Boll(当前symbol)</button>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- 折叠成交量 -->
+  <label>
+    <input type="checkbox" id="toggle-volume" checked />
+    显示成交量图
+  </label>
+</div>
+
+<div id="charts-wrapper">
+  <!-- 上方图表(价格+MA+布林带) 固定500px高 -->
+  <div id="price-chart-container"></div>
+  <!-- 下方图表(成交量) 固定200px高 -->
+  <div id="volume-chart-container"></div>
+</div>
+
+<script>
+  // 连接后端Socket.IO
+  const socket = io();
+
+  // ========== 1. 创建价格图表 (固定在 #price-chart-container 中) ==========
+  const priceChartContainer = document.getElementById('price-chart-container');
+  const priceChart = LightweightCharts.createChart(priceChartContainer, {
+    layout: { background: { color: '#ffffff' }, textColor: '#333' },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const candleSeries = priceChart.addCandlestickSeries({
+    upColor: '#26a69a',
+    downColor: '#ef5350',
+    borderVisible: false,
+    wickUpColor: '#26a69a',
+    wickDownColor: '#ef5350',
+  });
+  const ma7Series = priceChart.addLineSeries({ color: '#2196F3', lineWidth: 1 });
+  const ma25Series = priceChart.addLineSeries({ color: '#9C27B0', lineWidth: 1 });
+  const ma99Series = priceChart.addLineSeries({ color: '#FF9800', lineWidth: 1 });
+  const bbUpperSeries = priceChart.addLineSeries({ color: 'rgba(255,0,0,0.6)', lineWidth: 1 });
+  const bbMiddleSeries = priceChart.addLineSeries({ color: 'rgba(0,0,255,0.6)', lineWidth: 1 });
+  const bbLowerSeries = priceChart.addLineSeries({ color: 'rgba(255,0,0,0.6)', lineWidth: 1 });
+
+  // ========== 2. 创建成交量图表 (固定在 #volume-chart-container 中) ==========
+  const volumeChartContainer = document.getElementById('volume-chart-container');
+  const volumeChart = LightweightCharts.createChart(volumeChartContainer, {
+    layout: { background: { color: '#ffffff' }, textColor: '#333' },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const volumeSeries = volumeChart.addHistogramSeries({
+    color: '#26a69a',
+    priceFormat: { type: 'volume' },
+  });
+
+  // ========== 3. 自适应宽度, 但保持固定高度 ==========
+  function resizeCharts() {
+    // priceChartContainer有固定height: 500px (CSS里设置), 只需要按其宽度来resize
+    const pRect = priceChartContainer.getBoundingClientRect();
+    priceChart.applyOptions({
+      width: pRect.width,
+      height: pRect.height
+    });
+
+    // volumeChartContainer有固定height: 200px (CSS里设置)
+    const vRect = volumeChartContainer.getBoundingClientRect();
+    volumeChart.applyOptions({
+      width: vRect.width,
+      height: vRect.height
+    });
+  }
+  // 初始和窗口变化时，都要调用
+  window.addEventListener('resize', resizeCharts);
+
+  // ========== 4. 时间轴同步 (LogicalRange) ==========
+  let isSyncing = false;
+  priceChart.timeScale().subscribeVisibleLogicalRangeChange((newRange) => {
+    if (isSyncing || !newRange) return;
+    isSyncing = true;
+    volumeChart.timeScale().setVisibleLogicalRange(newRange);
+    isSyncing = false;
+  });
+  volumeChart.timeScale().subscribeVisibleLogicalRangeChange((newRange) => {
+    if (isSyncing || !newRange) return;
+    isSyncing = true;
+    priceChart.timeScale().setVisibleLogicalRange(newRange);
+    isSyncing = false;
+  });
+
+  // ========== 5. 加载完整数据接口 ==========
+  let currentSymbol = 'BTCUSDT';
+  let currentInterval = '1m';
+
+  async function loadAllData(symbol, interval) {
+    const url = `/get_klines?symbol=${symbol}&interval=${interval}`;
+    const resp = await fetch(url);
+    const json = await resp.json();
+    if (json.error) {
+      console.error(json.error);
+      return;
+    }
+    const arr = json.data;
+    // 分拆
+    const candleData = [];
+    const ma7Data = [];
+    const ma25Data = [];
+    const ma99Data = [];
+    const bbUData = [];
+    const bbMData = [];
+    const bbLData = [];
+    const volData = [];
+
+    for (const d of arr) {
+      candleData.push({
+        time: d.time,
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close,
+      });
+      ma7Data.push({ time: d.time, value: d.ma7 ?? NaN });
+      ma25Data.push({ time: d.time, value: d.ma25 ?? NaN });
+      ma99Data.push({ time: d.time, value: d.ma99 ?? NaN });
+      bbUData.push({ time: d.time, value: d.bb_upper ?? NaN });
+      bbMData.push({ time: d.time, value: d.bb_middle ?? NaN });
+      bbLData.push({ time: d.time, value: d.bb_lower ?? NaN });
+      volData.push({
+        time: d.time,
+        value: d.volume,
+        color: d.close >= d.open ? '#26a69a' : '#ef5350',
+      });
+    }
+    // setData
+    candleSeries.setData(candleData);
+    ma7Series.setData(ma7Data);
+    ma25Series.setData(ma25Data);
+    ma99Series.setData(ma99Data);
+    bbUpperSeries.setData(bbUData);
+    bbMiddleSeries.setData(bbMData);
+    bbLowerSeries.setData(bbLData);
+    volumeSeries.setData(volData);
+
+    // 重新resize，以防加载数据后容器尺寸变化
+    resizeCharts();
+  }
+
+  // ========== 6. “切换并加载” 按钮 => 通知后端订阅 => 再loadAllData ==========
+  document.getElementById('load-btn').addEventListener('click', () => {
+    const sym = document.getElementById('symbol-input').value.trim().toUpperCase() || 'BTCUSDT';
+    const itv = document.getElementById('interval-select').value;
+
+    socket.emit('change_symbol_interval', {
+      old_symbol: currentSymbol,
+      old_interval: currentInterval,
+      new_symbol: sym,
+      new_interval: itv
+    });
+
+    currentSymbol = sym;
+    currentInterval = itv;
+    loadAllData(sym, itv);
+  });
+
+  // ========== 7. 保存Boll参数(只针对当前symbol/interval) ==========
+  document.getElementById('save-boll-btn').addEventListener('click', async () => {
+    const periodVal = parseInt(document.getElementById('boll-period').value, 10);
+    const kVal = parseFloat(document.getElementById('boll-k').value);
+    const body = {
+      symbol: currentSymbol,
+      interval: currentInterval,
+      period: periodVal,
+      k: kVal
+    };
+    const resp = await fetch('/set_boll_params', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const js = await resp.json();
+    if (js.error) {
+      alert("设置失败: " + js.error);
+    } else {
+      console.log("Boll参数更新成功 => 重新加载");
+      loadAllData(currentSymbol, currentInterval);
+    }
+  });
+
+  // ========== 8. 折叠/显示 成交量图表 ==========
+  const toggleVolumeCheckbox = document.getElementById('toggle-volume');
+  toggleVolumeCheckbox.addEventListener('change', (e) => {
+    const checked = e.target.checked;
+    if (checked) {
+      // 显示
+      volumeChartContainer.classList.remove('hidden');
+    } else {
+      // 隐藏
+      volumeChartContainer.classList.add('hidden');
+    }
+    // 让图表知道容器大小变了
+    resizeCharts();
+  });
+
+  // ========== 9. 首次加载(默认BTCUSDT/1m) ==========
+  loadAllData(currentSymbol, currentInterval);
+
+  // ========== 10. 监听实时推送, 增量更新 ==========
+  socket.on('kline_update', (payload) => {
+    if (!payload || !payload.symbol || !payload.interval || !payload.kline) return;
+    if (payload.symbol !== currentSymbol || payload.interval !== currentInterval) return;
+
+    const d = payload.kline;
+    // 更新各系列
+    candleSeries.update({
+      time: d.time,
+      open: d.open,
+      high: d.high,
+      low: d.low,
+      close: d.close
+    });
+    ma7Series.update({ time: d.time, value: d.ma7 ?? NaN });
+    ma25Series.update({ time: d.time, value: d.ma25 ?? NaN });
+    ma99Series.update({ time: d.time, value: d.ma99 ?? NaN });
+    bbUpperSeries.update({ time: d.time, value: d.bb_upper ?? NaN });
+    bbMiddleSeries.update({ time: d.time, value: d.bb_middle ?? NaN });
+    bbLowerSeries.update({ time: d.time, value: d.bb_lower ?? NaN });
+
+    volumeSeries.update({
+      time: d.time,
+      value: d.volume,
+      color: d.close >= d.open ? '#26a69a' : '#ef5350',
+    });
+  });
+</script>
+</body>
+</html>
