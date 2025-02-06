@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Paper Trading Page</title>
+  <script src="https://cdn.socket.io/3.1.3/socket.io.min.js"></script>
+  <script src="https://unpkg.com/lightweight-charts@4.1.1/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    /* 全局样式 */
+    body {
+      margin: 0;
+      padding: 0;
+      font-family: sans-serif;
+    }
+    #controls {
+      padding: 10px;
+      background: #f1f1f1;
+    }
+    /* charts-wrapper: 一个不自动伸展的容器，包含3个固定高度区域 */
+    #charts-wrapper {
+      margin: 20px;
+      width: calc(100% - 40px);
+      border: 1px solid #ddd;
+    }
+    /* 上方价格图 (固定500px) */
+    #price-chart-container {
+      height: 500px;
+      position: relative;
+      background: #fff;
+      margin-bottom: 4px;
+    }
+    /* 中间成交量图 (固定200px) */
+    #volume-chart-container {
+      height: 200px;
+      position: relative;
+      background: #fff;
+      margin-bottom: 4px;
+    }
+    /* 下方盈亏曲线 (固定200px) */
+    #pnl-chart-container {
+      height: 200px;
+      position: relative;
+      background: #fff;
+    }
+    /* 隐藏时 */
+    .hidden {
+      display: none !important;
+    }
+    /* 模拟账户信息与交易记录 */
+    #account-info, #trade-info {
+      margin: 10px;
+    }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <!-- Symbol/Interval 切换 -->
+  <label>Symbol:</label>
+  <input type="text" id="symbol-input" value="BTCUSDT" style="width:80px" />
+
+  <label>Interval:</label>
+  <select id="interval-select">
+    <option value="1m" selected>1m</option>
+    <option value="5m">5m</option>
+    <option value="15m">15m</option>
+    <option value="1h">1h</option>
+    <option value="4h">4h</option>
+    <option value="1d">1d</option>
+  </select>
+  <button id="reload-btn">切换并加载</button>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- 策略选择(示例) -->
+  <label>策略:</label>
+  <select id="strategy-select">
+    <option value="boll">Boll策略</option>
+    <option value="ma">MA策略</option>
+  </select>
+  <button id="load-strategy-btn">加载策略</button>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- 开始/结束/重置 -->
+  <button id="start-btn">开始模拟</button>
+  <button id="stop-btn">结束模拟</button>
+  <button id="reset-btn">重置模拟盘</button>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- 折叠成交量 -->
+  <label>
+    <input type="checkbox" id="toggle-volume" checked />
+    显示成交量图
+  </label>
+
+  &nbsp;&nbsp;&nbsp;
+  <button id="goto-main">返回主页</button>
+</div>
+
+<div id="charts-wrapper">
+  <!-- 价格图 -->
+  <div id="price-chart-container"></div>
+  <!-- 成交量图 -->
+  <div id="volume-chart-container"></div>
+  <!-- 盈亏曲线 -->
+  <div id="pnl-chart-container"></div>
+</div>
+
+<!-- 模拟账户信息 -->
+<div id="account-info">
+  <h3>模拟账户信息</h3>
+  <p>Balance: <span id="balance"></span></p>
+  <p>Position: <span id="position"></span></p>
+  <p>Avg Price: <span id="avgprice"></span></p>
+  <p>Unrealized PnL: <span id="upnl"></span></p>
+  <p>Realized PnL: <span id="rpnl"></span></p>
+</div>
+
+<!-- 交易记录 -->
+<div id="trade-info">
+  <h3>交易记录</h3>
+  <ul id="trade-log"></ul>
+</div>
+
+<script>
+  const socket = io();
+
+  // ========== 1. 创建价格图表 =============
+  const priceChartContainer = document.getElementById('price-chart-container');
+  const priceChart = LightweightCharts.createChart(priceChartContainer, {
+    layout: { background: { color: '#ffffff' }, textColor: '#333' },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const candleSeries = priceChart.addCandlestickSeries({
+    upColor: '#26a69a',
+    downColor: '#ef5350',
+    borderVisible: false,
+    wickUpColor: '#26a69a',
+    wickDownColor: '#ef5350',
+  });
+
+  // 这里也可加MA, Boll上下轨line
+  // const maLine = priceChart.addLineSeries({...});
+  // ...
+
+  // ========== 2. 成交量图表 =============
+  const volumeChartContainer = document.getElementById('volume-chart-container');
+  const volumeChart = LightweightCharts.createChart(volumeChartContainer, {
+    layout: { background: { color: '#ffffff' }, textColor: '#333' },
+    timeScale: { timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  });
+  const volumeSeries = volumeChart.addHistogramSeries({
+    color: '#26a69a',
+    priceFormat: { type: 'volume' },
+  });
+
+  // ========== 3. 盈亏曲线图 ============
+  const pnlChartContainer = document.getElementById('pnl-chart-container');
+  const pnlChart = LightweightCharts.createChart(pnlChartContainer, {
+    layout: { background: { color:'#fff'}, textColor:'#333' },
+    timeScale: { timeVisible: true, secondsVisible: false },
+  });
+  const pnlLine = pnlChart.addLineSeries({
+    color: 'green',
+    lineWidth: 2,
+  });
+  let pnlData = []; // {time, value}数组
+
+  // ========== 4. 自适应大小(固定高度, 但随宽度变化) =============
+  function resizeAllCharts() {
+    // 价格图
+    const pRect = priceChartContainer.getBoundingClientRect();
+    priceChart.applyOptions({ width: pRect.width, height: pRect.height });
+
+    // 成交量图
+    const vRect = volumeChartContainer.getBoundingClientRect();
+    volumeChart.applyOptions({ width: vRect.width, height: vRect.height });
+
+    // 盈亏图
+    const pnlRect = pnlChartContainer.getBoundingClientRect();
+    pnlChart.applyOptions({ width: pnlRect.width, height: pnlRect.height });
+  }
+  window.addEventListener('resize', resizeAllCharts);
+
+  // ========== 5. 时间轴同步 (LogicalRange) ==========
+  let isSyncing = false;
+  priceChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if(isSyncing || !range) return;
+    isSyncing=true;
+    volumeChart.timeScale().setVisibleLogicalRange(range);
+    pnlChart.timeScale().setVisibleLogicalRange(range);
+    isSyncing=false;
+  });
+  volumeChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if(isSyncing||!range)return;
+    isSyncing=true;
+    priceChart.timeScale().setVisibleLogicalRange(range);
+    pnlChart.timeScale().setVisibleLogicalRange(range);
+    isSyncing=false;
+  });
+  pnlChart.timeScale().subscribeVisibleLogicalRangeChange(range=>{
+    if(isSyncing||!range)return;
+    isSyncing=true;
+    priceChart.timeScale().setVisibleLogicalRange(range);
+    volumeChart.timeScale().setVisibleLogicalRange(range);
+    isSyncing=false;
+  });
+
+  // ========== 6. 当前 Symbol/Interval ==========
+  let currentSymbol='BTCUSDT';
+  let currentInterval='1m';
+  let tradeMarkers=[]; // 存放买卖标记
+
+  // ========== 7. 加载数据函数 (含价格+成交量+盈亏清空) ==========
+  async function loadAllData(symbol, interval){
+    const url= `/get_klines?symbol=${symbol}&interval=${interval}`;
+    const resp=await fetch(url);
+    const js=await resp.json();
+    if(js.error){ console.error(js.error); return;}
+    const arr=js.data;
+
+    const candleData=[];
+    const volumeData=[];
+    for(const d of arr){
+      candleData.push({
+        time: d.time,
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close
+      });
+      volumeData.push({
+        time: d.time,
+        value: d.volume,
+        color: (d.close>=d.open) ? '#26a69a':'#ef5350'
+      });
+    }
+    // 设置到图表
+    candleSeries.setData(candleData);
+    volumeSeries.setData(volumeData);
+
+    // 清空盈亏线
+    pnlData=[];
+    pnlLine.setData(pnlData);
+
+    // 清空交易标记
+    tradeMarkers=[];
+    candleSeries.setMarkers(tradeMarkers);
+
+    resizeAllCharts();
+  }
+
+  // ========== 8. 点击“切换并加载”==========
+  document.getElementById('reload-btn').addEventListener('click', ()=>{
+    const sym = document.getElementById('symbol-input').value.trim().toUpperCase()||'BTCUSDT';
+    const itv= document.getElementById('interval-select').value;
+    socket.emit('change_symbol_interval',{
+      old_symbol: currentSymbol, old_interval: currentInterval,
+      new_symbol: sym, new_interval: itv
+    });
+    currentSymbol=sym; currentInterval=itv;
+    loadAllData(sym,itv);
+  });
+
+  // ========== 9. 策略选择(示例) ==========
+  document.getElementById('load-strategy-btn').addEventListener('click', ()=>{
+    const strategy= document.getElementById('strategy-select').value;
+    alert("加载 "+strategy+" 策略参数(可向后端请求)");
+  });
+
+  // ========== 10. 开始/结束/重置 模拟盘 ==========
+  document.getElementById('start-btn').addEventListener('click',()=>{
+    fetch('/paper_start',{method:'POST'})
+      .then(r=>r.json())
+      .then(js=>alert(js.msg));
+  });
+  document.getElementById('stop-btn').addEventListener('click',()=>{
+    fetch('/paper_stop',{method:'POST'})
+      .then(r=>r.json())
+      .then(js=>alert(js.msg));
+  });
+  document.getElementById('reset-btn').addEventListener('click',()=>{
+    fetch('/paper_trading_reset',{method:'POST'})
+      .then(r=>r.json())
+      .then(js=>{
+        alert(js.msg);
+        refreshAccountInfo();
+        // 清空交易标记
+        tradeMarkers=[];
+        candleSeries.setMarkers(tradeMarkers);
+        // 清空盈亏线
+        pnlData=[];
+        pnlLine.setData(pnlData);
+        document.getElementById('trade-log').innerHTML='';
+      });
+  });
+
+  // ========== 11. 折叠/显示成交量图 ==========
+  const toggleVolume = document.getElementById('toggle-volume');
+  toggleVolume.addEventListener('change',(e)=>{
+    const checked=e.target.checked;
+    if(checked){
+      volumeChartContainer.classList.remove('hidden');
+    }else{
+      volumeChartContainer.classList.add('hidden');
+    }
+    resizeAllCharts();
+  });
+
+  // ========== 12. 返回主页按钮 ==========
+  document.getElementById('goto-main').addEventListener('click',()=>{
+    window.location.href='/';
+  });
+
+  // ========== 13. SocketIO 监听 kline_update ==========
+  socket.on('kline_update',(payload)=>{
+    if(!payload || !payload.symbol || !payload.interval || !payload.kline)return;
+    if(payload.symbol===currentSymbol && payload.interval===currentInterval){
+      const d= payload.kline;
+      candleSeries.update({
+        time: d.time,
+        open: d.open,
+        high: d.high,
+        low: d.low,
+        close: d.close
+      });
+      volumeSeries.update({
+        time: d.time,
+        value: d.volume,
+        color: (d.close>=d.open)?'#26a69a':'#ef5350'
+      });
+      // 每来一根新K线 => 更新盈亏曲线
+      refreshPnlLine(d.time);
+      // 更新账户信息
+      refreshAccountInfo();
+    }
+  });
+
+  // ========== 14. 监听 trade_event => 买卖标记 + 交易记录 ==========
+  socket.on('trade_event',(trade)=>{
+    // trade: {barTime, side, qty, price, fee, pnl}
+    const li = document.createElement('li');
+    li.textContent= `[${trade.barTime}] ${trade.side.toUpperCase()} qty=${trade.qty.toFixed(4)}, price=${trade.price.toFixed(2)}, fee=${trade.fee.toFixed(4)}, pnl=${trade.pnl.toFixed(2)}`;
+    document.getElementById('trade-log').appendChild(li);
+
+    // 在K线图加marker
+    let marker={
+      time: trade.barTime,
+      position: (trade.side==='buy')?'below':'above',
+      color: (trade.side==='buy')?'green':'red',
+      shape: (trade.side==='buy')?'arrowUp':'arrowDown',
+      text: trade.side.toUpperCase()+'@'+trade.price.toFixed(2)
+    };
+    tradeMarkers.push(marker);
+    candleSeries.setMarkers(tradeMarkers);
+  });
+
+  // ========== 15. 刷新账户信息 ==========
+  function refreshAccountInfo(){
+    fetch('/paper_trading_info')
+      .then(r=>r.json())
+      .then(info=>{
+        document.getElementById('balance').textContent= info.balance.toFixed(2);
+        document.getElementById('position').textContent= info.position.toFixed(4);
+        document.getElementById('avgprice').textContent= info.avg_price.toFixed(2);
+        document.getElementById('upnl').textContent= info.unrealized_pnl.toFixed(2);
+        document.getElementById('rpnl').textContent= info.realized_pnl.toFixed(2);
+      })
+      .catch(e=>console.error(e));
+  }
+
+  // ========== 16. 刷新盈亏曲线(LineSeries) ==========
+  let pnlLastTime=0;
+  function refreshPnlLine(barTime){
+    // barTime 为K线时间
+    fetch('/paper_trading_info')
+      .then(r=>r.json())
+      .then(info=>{
+        const totalPnl= info.realized_pnl + info.unrealized_pnl;
+        pnlData.push({ time: barTime, value: totalPnl });
+        pnlLine.setData(pnlData);
+      })
+      .catch(e=>console.error(e));
+  }
+
+  // 初始化加载
+  loadAllData(currentSymbol, currentInterval);
+  refreshAccountInfo();
+</script>
+
+</body>
+</html>

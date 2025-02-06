@@ -1,14 +1,12 @@
 {
-  "trading": {
-    "init_balance": 10000,
-    "fee_rate": 0.0007,
-    "slip_rate": 0.0005,
-    "min_qty": 0.001,
-    "use_balance_ratio": 0.5
-  },
-  "boll_strategy": {
-    "period": 20,
-    "k": 2.0
+    "trading": {
+      "init_balance": 10000,
+      "fee_rate": 0.0007,
+      "slip_rate": 0.0005
+    },
+    "boll_strategy": {
+      "period": 20,
+      "k": 2.0
+    }
   }
-}
   

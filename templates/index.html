@@ -75,6 +75,10 @@
     <input type="checkbox" id="toggle-volume" checked />
     显示成交量图
   </label>
+
+  &nbsp;&nbsp;&nbsp;
+  <!-- index.html (节选) -->
+  <button id="goto-paper">前往模拟盘</button>
 </div>
 
 <div id="charts-wrapper">
@@ -297,6 +301,11 @@
       value: d.volume,
       color: d.close >= d.open ? '#26a69a' : '#ef5350',
     });
+  });
+
+  // 前往模拟盘按钮点击事件
+  document.getElementById('goto-paper').addEventListener('click', () => {
+    window.location.href = '/paper';
   });
 </script>
 </body>
